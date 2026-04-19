@@ -508,13 +508,13 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
     )
 
     try:
-        from .dialect import Dialect
-        dialect = Dialect()
-        expanded_entry = dialect.expand(entry)
-
+        # TODO: Future versions should expand AAAK before embedding to improve
+        # semantic search quality. For now, store raw AAAK in metadata so it's
+        # preserved, and keep the document as-is for embedding (even though
+        # compressed AAAK degrades embedding quality).
         col.add(
             ids=[entry_id],
-            documents=[expanded_entry],
+            documents=[entry],
             metadatas=[
                 {
                     "wing": wing,
@@ -525,7 +525,6 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
                     "agent": agent_name,
                     "filed_at": now.isoformat(),
                     "date": now.strftime("%Y-%m-%d"),
-                    "raw_aaak": entry,
                 }
             ],
         )
@@ -569,7 +568,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10):
                     "date": meta.get("date", ""),
                     "timestamp": meta.get("filed_at", ""),
                     "topic": meta.get("topic", ""),
-                    "content": meta.get("raw_aaak", doc),
+                    "content": doc,
                 }
             )
 

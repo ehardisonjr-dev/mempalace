@@ -909,46 +909,6 @@ class Dialect:
 
     # === DECODING ===
 
-    def expand(self, dialect_text: str) -> str:
-        """Expand an AAAK Dialect string back into natural English text for embedding."""
-        decoded = self.decode(dialect_text)
-        parts = []
-
-        if decoded["header"]:
-            h = decoded["header"]
-            parts.append(f"Source file: {h.get('file', '?')} ({h.get('title', '?')}) from {h.get('date', '?')}.")
-            if h.get("entities") and h.get("entities") != "???":
-                parts.append(f"Primary entities involved: {h['entities'].replace('+', ', ')}.")
-
-        if decoded["arc"]:
-            parts.append(f"Emotional arc: {decoded['arc'].replace('->', ' to ')}.")
-
-        for i, z in enumerate(decoded["zettels"]):
-            z_parts = z.split("|")
-            if len(z_parts) > 1:
-                topic = z_parts[1].replace("_", " ")
-                parts.append(f"Observation {i+1} regarding {topic}:")
-                for p in z_parts[2:]:
-                    if p.startswith('"') and p.endswith('"'):
-                        parts.append(f"Key quote: {p}.")
-                    elif p in ("ORIGIN", "CORE", "SENSITIVE", "PIVOT", "GENESIS", "DECISION", "TECHNICAL"):
-                        parts.append(f"This is a {p} moment.")
-                    elif not p.replace(".", "").isdigit():
-                        parts.append(f"Emotions/Tone: {p.replace('+', ', ')}.")
-            else:
-                parts.append(z)
-
-        for t in decoded["tunnels"]:
-            t_parts = t.split("|")
-            if len(t_parts) > 1:
-                parts.append(f"Connection: {t_parts[1]}")
-
-        # If it wasn't valid AAAK or couldn't be parsed well, just return the text
-        if not parts:
-            return dialect_text
-
-        return " ".join(parts)
-
     def decode(self, dialect_text: str) -> dict:
         """Parse an AAAK Dialect string back into a readable summary."""
         lines = dialect_text.strip().split("\n")
