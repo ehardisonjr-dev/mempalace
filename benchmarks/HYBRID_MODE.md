@@ -196,9 +196,9 @@ python benchmarks/longmemeval_bench.py data/longmemeval_s_cleaned.json --mode hy
 
 ```bash
 # Setup
-git clone -b ben/benchmarking https://github.com/aya-thekeeper/mempal.git
-cd mempal
-pip install chromadb
+git clone https://github.com/MemPalace/mempalace.git
+cd mempalace
+uv sync --extra dev   # or: pip install -e ".[dev]"
 
 # Download data
 mkdir -p /tmp/longmemeval-data
@@ -400,7 +400,9 @@ Some assistant-reference failures had the correct session at rank 11-12 — just
 
 ## How LLM Re-ranking Works (`--llm-rerank`)
 
-An optional fourth pass that works with any retrieval mode. Add `--llm-rerank` to any run.
+An optional fourth pass that works with any retrieval mode. In LongMemEval, it runs before the final recall cutoff, so it can change which evidence appears in the top-k results.
+
+In `locomo_bench.py`, `--llm-rerank` only reorders IDs already selected by the top-k cutoff. LoCoMo's Avg Recall checks evidence membership and ignores result order, so the flag cannot change that metric. Omit it for recall-only LoCoMo comparisons to avoid the extra LLM calls, latency, and any configured provider charges. Keep the mode, granularity, and top-k the same when comparing runs.
 
 ```python
 # After hybrid_v2 retrieval, take top-10 sessions
@@ -435,7 +437,6 @@ If the API call fails (timeout, rate limit, no key), the function catches the ex
 **Key loading priority:**
 1. `--llm-key` CLI flag
 2. `ANTHROPIC_API_KEY` environment variable
-3. `~/.config/lu/keys.json` (checks `anthropic.lu_key` and similar paths)
 
 ## What Changed in the Code
 

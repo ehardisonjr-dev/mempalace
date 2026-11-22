@@ -1,0 +1,303 @@
+# Configuration
+
+## Global Config
+
+Located at `~/.mempalace/config.json`:
+
+```json
+{
+  "palace_path": "/custom/path/to/palace",
+  "collection_name": "mempalace_drawers",
+  "people_map": {"Kai": "KAI", "Priya": "PRI"},
+  "max_backups": 10
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `palace_path` | `~/.mempalace/palace` | Where the default local palace stores your drawers |
+| `collection_name` | `mempalace_drawers` | Default backend collection name |
+| `people_map` | `{}` | Entity name → AAAK code mappings |
+| `max_backups` | `10` | How many timestamped palace backups to keep before the oldest are pruned. Applies to `mempalace migrate` (`<palace>.pre-migrate.*`) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-*`), which each write a full copy every run. Set to `0` to keep every backup (e.g. when an external retention policy manages cleanup). |
+
+Each setting resolves from its environment variable first, then
+`config.json`, then the default (`backend` is the exception: `config.json`
+wins over `MEMPALACE_BACKEND`). `mempalace init` creates `config.json` only
+when there is none, and records only what you chose: `--palace`, `--lang`
+and `--backend`. Defaults stay out of the file, so a later release's defaults
+still reach you, and a `MEMPALACE_PALACE_PATH` set in your shell is not
+copied into it.
+
+## Embedding models and devices
+
+Set `embedding_model` and `embedding_device` in `config.json`, or use
+`MEMPALACE_EMBEDDING_MODEL` and `MEMPALACE_EMBEDDING_DEVICE` in the shell that
+runs MemPalace. Environment values take precedence. Without a configured model,
+`minilm` is the compatibility default; the device defaults to `auto`.
+
+| Model / runtime | CPU | NVIDIA CUDA (`cuda`) | Windows DirectML (`dml`) | Apple Core ML (`coreml`) | Apple Metal (`mps`) |
+| --- | --- | --- | --- | --- | --- |
+| `minilm` / ONNX | Yes | Install `mempalace[gpu]` | Install `mempalace[dml]` | Disabled by ChromaDB; uses CPU | No; interpreted as `auto` |
+| `embeddinggemma` / ONNX | Yes | Install `mempalace[gpu]` | Install `mempalace[dml]` | Skipped by `auto`; explicit requests must pass a health check or fall back to CPU | No; interpreted as `auto` |
+| `embeddinggemma2` / PyTorch, experimental | Yes | Requires a CUDA-enabled PyTorch build | No; interpreted as `auto` | No; interpreted as `auto` | Yes, when PyTorch and the model health checks support it |
+| `openai-compat` / HTTP endpoint | Endpoint decides | Endpoint decides | Endpoint decides | Endpoint decides | Endpoint decides |
+
+`auto` selects an available provider compatible with the model. For the built-in
+ONNX models this means CUDA, then DirectML, then CPU. EmbeddingGemma 2 prefers
+CUDA, then MPS, then CPU. An unavailable accelerator warns and falls back to CPU.
+An enabled ONNX accelerator can still run unsupported graph nodes on CPU; its
+presence does not mean every operation runs on the GPU. For `openai-compat`,
+hardware selection belongs to the endpoint and `embedding_device` has no effect.
+
+### Apple Silicon mining
+
+CPU is expected for the standard ONNX models on M-series Macs:
+
+- **MiniLM:** ChromaDB removes CoreML from its inference session because that
+  path is less optimized than CPU. Both `auto` and explicit `coreml` report CPU.
+- **EmbeddingGemma 300m ONNX:** CoreML has produced NaN or all-zero vectors for
+  the quantized model. Automatic selection excludes it; an explicit `coreml`
+  request is checked before embedding and falls back to CPU if the check fails.
+
+Installing `mempalace[coreml]` or setting `embedding_device=mps` does not enable
+Apple GPU inference for these ONNX models. You can keep the existing model and
+make CPU selection explicit:
+
+```bash
+MEMPALACE_EMBEDDING_DEVICE=cpu mempalace mine /path/to/project --wing MyProject
+```
+
+For an experimental Apple GPU path, install `mempalace[embeddinggemma2]` in an
+isolated environment and select `embedding_model=embeddinggemma2` with
+`embedding_device=mps` (or `auto`). MPS failures or invalid/non-repeatable vectors
+warn and retry on CPU. Follow the [EmbeddingGemma 2 setup and safe migration
+guide](https://github.com/MemPalace/mempalace/blob/develop/docs/embeddinggemma2.md)
+before changing an existing palace's model. Another option is a deliberately
+configured local `openai-compat` endpoint whose embedding server supports Metal.
+
+The `Device:` line in `mempalace mine` and `mempalace status` shows the resolved
+provider. Before the first inference it uses model-compatible selection without
+loading weights; subsequent status checks in the same process reflect a loaded
+session's CPU fallback. A fresh process cannot know whether an earlier process
+fell back. Warnings during inference explain later changes. Mesh node profiles
+use the same device reporting, subject to their 60-second profile cache.
+
+Changing only the device keeps the same vector space and needs no rebuild.
+Changing the model, revision, dimension, or modalities requires re-embedding;
+do not mix the new model's vectors with an existing palace's index.
+
+### Other Mac hardware
+
+Device selection checks runtime capabilities and model compatibility; it does
+not depend on a particular M-series chip. The MiniLM CPU selection above also
+applies on Intel Macs and to ONNX Runtime builds without CoreML, provided the
+installed dependencies support that Mac and macOS version. CoreML being listed
+as available does not establish that a model runs on a GPU or Neural Engine.
+
+The optional EmbeddingGemma 2 install has a narrower platform limit. It requires
+`torch>=2.14.0`, whose official macOS wheels are for Apple Silicon; PyTorch
+[ended official Intel Mac support after 2.2.x](https://pytorch.org/blog/pytorch2-2/).
+Selecting `embedding_device=cpu` does not make that extra installable on Intel
+Macs. Use an ONNX model with compatible dependencies, or a configured
+`openai-compat` endpoint, on those machines. CPU fallback applies to a backend
+that is already installed; macOS and Python requirements still depend on its
+packages. Available MPS support is checked at runtime on Apple Silicon.
+
+## Storage backends
+
+ChromaDB is the default and needs no configuration. MemPalace also ships a
+pluggable backend contract, exercised across deliberately different substrates
+(an embedded store, an exact-cosine local store, a REST store, and a SQL/JSONB
+store) so the contract is never accidentally shaped around one vendor. Every
+non-default backend is opt-in.
+
+| Backend | Mode | Install | Namespaces | Lexical | Configure with |
+| ------- | ---- | ------- | :--------: | :-----: | -------------- |
+| `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
+| `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
+| `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
+| `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
+| `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
+<!-- New backends add one row here and one `### <Backend>` subsection (with its connection variables) below; keep README's compatibility table in sync. -->
+
+Select a backend with `--backend <name>` on any `mempalace` / `mempalace-mcp`
+command, `MEMPALACE_BACKEND=<name>` in the environment, or `"backend": "<name>"`
+in `config.json`.
+
+::: warning Verbatim data leaves your machine on opt-in
+When a server-mode backend points anywhere other than your own local or trusted
+self-hosted service, MemPalace sends and stores verbatim drawer text and
+metadata there. That is an explicit, deliberate backend choice — never the
+default.
+:::
+
+Server-mode backends isolate tenants by namespace and write a local marker file
+(`<backend>_backend.json`) in the palace directory, guarding against silently
+opening a palace against the wrong server.
+
+### ChromaDB
+
+The default. Local, embedded, no service to run. Drawers are stored at
+[`palace_path`](#global-config); there are no connection settings to configure.
+
+### SQLite exact
+
+Local and built-in (no extra to install). Runs exact cosine over every row — no
+ANN index — so it is the reference for exact-vector correctness checks and small
+palaces. Select with `--backend sqlite_exact`; it has no connection settings.
+
+### Milvus
+
+A Milvus backend using `pymilvus`. Install the optional driver with
+`pip install mempalace[milvus]`. When `MEMPALACE_MILVUS_URI` is unset,
+MemPalace uses per-palace Milvus Lite at `<palace>/milvus.db`; set a server or
+Zilliz Cloud URI to use a shared Milvus deployment.
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `MEMPALACE_MILVUS_URI` | per-palace Milvus Lite | Milvus server / Zilliz Cloud URI |
+| `MEMPALACE_MILVUS_TOKEN` | _(none)_ | Token for Milvus server / Zilliz Cloud |
+| `MEMPALACE_MILVUS_DB_NAME` | _(none)_ | Optional Milvus database name |
+| `MEMPALACE_MILVUS_NAMESPACE` | _(none)_ | Collection namespace prefix (tenant isolation) |
+| `MEMPALACE_MILVUS_CONSISTENCY_LEVEL` | `Strong` | Milvus consistency level (`Strong`, `Session`, `Bounded`, `Eventually`) |
+
+### Qdrant
+
+A networked REST backend. No driver to install — the client uses the Python
+standard library — so you only need a [Qdrant](https://qdrant.tech/) instance
+you control.
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `MEMPALACE_QDRANT_URL` | `http://localhost:6333` | Qdrant REST endpoint |
+| `MEMPALACE_QDRANT_API_KEY` | _(none)_ | Sent as the `api-key` header when set |
+| `MEMPALACE_QDRANT_NAMESPACE` | _(none)_ | Collection namespace prefix (tenant isolation) |
+| `MEMPALACE_QDRANT_TIMEOUT` | `10.0` | REST request timeout, in seconds |
+
+### Postgres + pgvector
+
+A networked SQL/JSONB backend. Install the driver with
+`pip install mempalace[pgvector]`; the server must have the `vector` extension
+available.
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `MEMPALACE_PGVECTOR_DSN` | `postgresql://localhost:5432/mempalace` | Postgres connection string |
+| `MEMPALACE_PGVECTOR_NAMESPACE` | _(none)_ | Schema namespace (tenant isolation) |
+| `MEMPALACE_PGVECTOR_SHARED_NAMESPACE` | _(none)_ | Shared table namespace for one palace spanning several machines |
+
+#### Sharing one palace across machines
+
+Table names normally include a hash of the palace's **local** path, so two
+machines pointed at the same database write to different tables and never see
+each other's memory — with no error to warn you. If you want a laptop, a
+desktop and a server to share one memory store, give every node the same
+shared namespace:
+
+```bash
+export MEMPALACE_PGVECTOR_DSN=postgresql://user:pass@db.internal:5432/mempalace
+export MEMPALACE_PGVECTOR_SHARED_NAMESPACE=fleet
+```
+
+or `"pgvector_shared_namespace": "fleet"` in `config.json`. The local path then
+drops out of the table name and every node resolves the same tables.
+
+- Leave it unset for a single-machine palace — naming is unchanged and existing
+  palaces need no migration.
+- Setting it on a palace that already has data points at *new*, empty tables;
+  MemPalace refuses to open the palace rather than appear to lose data, so
+  choose the namespace before you mine.
+- Every palace that shares a namespace shares its memory, including two palaces
+  on the *same* machine. The setting declares "these are one logical palace", so
+  give anything that must stay separate its own namespace.
+- Allowed characters are letters, digits and `_ - . / :` or spaces; the value is
+  lower-cased and runs of separators fold to a single `_`, so `Team-A`,
+  `team_a` and `team__a` are all the same namespace. Anything else is rejected.
+- It is independent of `MEMPALACE_PGVECTOR_NAMESPACE`: that one still isolates
+  tenants, and the two can be combined.
+
+For an end-to-end deployment that puts a server-mode backend behind the MCP
+server, see [Remote / Team Server](/guide/remote-server).
+
+## Project Config
+
+Generated by `mempalace init` in your project directory. MemPalace never mines
+these files or samples them for entity detection, and `init` adds them to
+`.gitignore` in a git repository.
+
+### `mempalace.yaml`
+
+```yaml
+wing: myproject
+rooms:
+  - backend
+  - frontend
+  - decisions
+palace_path: ~/.mempalace/palace
+```
+
+The project config is the first of `mempalace.yaml`, `mempalace.yml`,
+`mempal.yaml` and `mempal.yml` that exists; `mempal.*` is the legacy name. When
+several exist, the first is used and the others are named on stderr. `init`
+updates the one in use and writes `mempalace.yaml` only when there is none.
+
+### `entities.json`
+
+The entities you confirmed during `init`:
+
+```json
+{
+  "people": ["Kai", "Priya"],
+  "projects": ["myproject"]
+}
+```
+
+`mempalace compress` also looks for an `entities.json` holding AAAK entity
+codes (`{"entities": {"Kai": "KAI"}}`). `init` never overwrites a file in that
+format.
+
+Wings are auto-detected during `mempalace init` from:
+- Directory names → project wings
+- Detected people in file content → person wings
+- Explicit `--wing` flag on mine commands
+
+## Identity
+
+Located at `~/.mempalace/identity.txt`. Plain text. Becomes Layer 0 — loaded every session.
+
+```text
+I am Atlas, a personal AI assistant for Alice.
+Traits: warm, direct, remembers everything.
+People: Alice (creator), Bob (Alice's partner).
+Project: A journaling app that helps people process emotions.
+```
+
+::: tip
+Write your identity file in first person from the AI's perspective. This becomes the AI's self-concept on wake-up.
+:::
+
+## Palace Path Override
+
+All commands accept `--palace <path>` to override the default location:
+
+```bash
+mempalace search "query" --palace /tmp/test-palace
+mempalace mine ~/data/ --palace /tmp/test-palace
+```
+
+The MCP server also accepts `--palace`:
+
+```bash
+python -m mempalace.mcp_server --palace /custom/palace
+```
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `MEMPALACE_PALACE_PATH` | Override palace path (same as `--palace`) |
+| `MEMPAL_DIR` | Directory for auto-mining in hooks |
+| `MEMPALACE_MAX_BACKUPS` | Override `max_backups` retention count (`0` disables pruning) |
+| `MEMPALACE_BACKEND` | Select the storage backend (default `chroma`) — see [Storage backends](#storage-backends) for each backend's connection variables |
+| `MEMPALACE_MCP_WRITER_WAIT_SECONDS` | Seconds a writable HTTP server waits at startup for another process to release the palace writer lease before exiting with status `2` (default `120`; `0` refuses immediately). See [Remote server](/guide/remote-server#operating-notes) |
+| `MEMPALACE_MCP_IDLE_HOURS` | Hours with no MCP request before the server exits by itself (default `8`; `0` disables). See [Remote server](/guide/remote-server#operating-notes) |

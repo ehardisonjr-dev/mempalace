@@ -10,7 +10,10 @@ mempalace imports — so that module-level initialisations (e.g.
 instead of the real user profile.
 """
 
+import hashlib
+import math
 import os
+import re
 import shutil
 import tempfile
 
@@ -26,6 +29,46 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
+# ── Drop the developer's own MemPalace settings for the session ─────────
+# Isolating HOME is not enough on a machine that configures MemPalace through
+# the environment. A contributor who exports MEMPALACE_BACKEND=pgvector and
+# MEMPALACE_PGVECTOR_DSN (the documented way to attach a shared backend) hands
+# those to every test, and tests that spawn a subprocess pass them on. Two
+# things then go wrong:
+#
+#   * Tests that build a palace in tmp_path select the ambient backend instead
+#     of the local default, and fail as BackendMismatchError once the on-disk
+#     artifacts disagree with the selected backend.
+#   * A test that redirects HOME and then runs a hook writes to the configured
+#     remote database. The palace path under the temp HOME hashes to a new
+#     table prefix, so the write lands in its own tables rather than the
+#     contributor's real ones — observed on a shared pgvector instance, where
+#     two `tests/test_antigravity_hooks_shell.py` cases left stray tables
+#     behind in the production database.
+#
+# CI sets none of these, so clearing them is what makes a local run reproduce
+# CI rather than the developer's own configuration. Values are captured for
+# the restore in ``_isolate_home`` and only ambient ones are removed: a test
+# that sets MEMPALACE_* through monkeypatch or an explicit subprocess env is
+# unaffected, because that happens after this module is imported.
+_PRESERVE_TEST_ENV = {
+    "MEMPALACE_DOCS_GA_ID",
+    "MEMPALACE_PGVECTOR_LIVE_DSN",
+    "MEMPALACE_PGVECTOR_LIVE_URL",
+    "MEMPALACE_QDRANT_LIVE_API_KEY",
+    "MEMPALACE_QDRANT_LIVE_URL",
+    "MEMPALACE_REQUIRE_NATIVE",
+    "MEMPALACE_RUN_EG2_AUDIO",
+    "MEMPALACE_RUN_EG2_IMAGE",
+    "MEMPALACE_TEST_EMBEDDINGGEMMA_ONNX",
+}
+for _var in [
+    _k
+    for _k in os.environ
+    if _k.startswith(("MEMPALACE_", "MEMPAL_")) and _k not in _PRESERVE_TEST_ENV
+]:
+    _original_env[_var] = os.environ.pop(_var)
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
@@ -33,17 +76,374 @@ import pytest  # noqa: E402
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
+_TEST_EMBED_DIM = 384
+_TEST_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_REAL_EMBEDDING_TEST_MODULES = {
+    "test_embedding",
+    "test_embedding_api",
+    "test_embeddinggemma",
+    "test_embeddinggemma2",
+    "test_embeddinggemma2_device",
+    "test_embeddinggemma2_integration",
+    "test_embedding_model_fallback",
+}
+
+
+def _stable_test_embedding(text: str) -> list[float]:
+    """Small deterministic embedding for tests that do not test ONNX itself."""
+    vec = [0.0] * _TEST_EMBED_DIM
+    tokens = _TEST_TOKEN_RE.findall((text or "").lower())
+    if not tokens:
+        tokens = [""]
+    for token in tokens:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        vec[int.from_bytes(digest[:4], "little") % _TEST_EMBED_DIM] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+class _StableTestEmbeddingFunction:
+    @staticmethod
+    def name() -> str:
+        return "default"
+
+    @staticmethod
+    def build_from_config(config):
+        _StableTestEmbeddingFunction.validate_config(config)
+        return _StableTestEmbeddingFunction()
+
+    @staticmethod
+    def validate_config(config) -> None:
+        return
+
+    def get_config(self) -> dict:
+        return {}
+
+    def is_legacy(self) -> bool:
+        return False
+
+    def default_space(self) -> str:
+        return "cosine"
+
+    def supported_spaces(self) -> list[str]:
+        return ["cosine", "l2", "ip"]
+
+    def embed_query(self, input):
+        return self(input=input)
+
+    def __call__(self, input):
+        return [_stable_test_embedding(str(text)) for text in list(input or [])]
+
+
+# Redirect ChromaDB's ONNX model cache back to the real user's cache so tests
+# don't re-download the 79 MB model on every run. The HOME redirect above
+# would otherwise point ONNXMiniLM_L6_V2.DOWNLOAD_PATH at the empty temp dir.
+try:
+    from pathlib import Path
+
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (
+        ONNXMiniLM_L6_V2,
+    )
+
+    _real_home = _original_env.get("USERPROFILE") or _original_env.get("HOME")
+    if _real_home:
+        _real_cache = Path(_real_home) / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        if _real_cache.exists():
+            ONNXMiniLM_L6_V2.DOWNLOAD_PATH = _real_cache
+except ImportError:
+    pass
+
 
 @pytest.fixture(autouse=True)
-def _reset_mcp_cache():
-    """Reset the MCP server's cached ChromaDB client/collection between tests."""
+def _stable_embedding_function_for_tests(request, monkeypatch):
+    """Keep ordinary tests off ChromaDB's native ONNX embedding path.
+
+    Module-sized Windows runs were crashing inside onnxruntime after many raw
+    Chroma add/query calls. The embedding-specific tests opt out below; every
+    other test gets a deterministic in-process EF so it still exercises vector
+    writes/search without loading native ONNX sessions.
+    """
+    module_name = getattr(getattr(request, "module", None), "__name__", "")
+    if module_name in _REAL_EMBEDDING_TEST_MODULES:
+        yield
+        return
+
+    ef = _StableTestEmbeddingFunction()
+
+    from chromadb.api.types import DefaultEmbeddingFunction
+
+    import mempalace.backends.chroma as chroma_mod
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    import mempalace.embedding as embedding_mod
+
+    monkeypatch.setattr(DefaultEmbeddingFunction, "__call__", lambda self, input: ef(input=input))
+    monkeypatch.setattr(
+        DefaultEmbeddingFunction, "embed_query", lambda self, input: ef(input=input)
+    )
+    monkeypatch.setattr(embedding_mod, "get_embedding_function", lambda *_, **__: ef)
+    monkeypatch.setattr(
+        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda **_: ef)
+    )
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts, **_: ef(input=list(texts)))
+    yield
+
+
+def _reset_loaded_mcp_writer_state(mcp_server) -> None:
+    """Release process-global MCP writer state between tests.
+
+    The atexit-registration flag is deliberately preserved. Its callback is
+    registered for the lifetime of the Python process, so resetting the flag
+    would allow later writer acquisitions to register duplicate callbacks.
+    """
+    release_writer_lock = getattr(
+        mcp_server,
+        "_release_mcp_writer_lock",
+        None,
+    )
+    try:
+        if callable(release_writer_lock):
+            release_writer_lock()
+    finally:
+        # Normalize status even when the prior test left a failed/read-only
+        # attempt rather than an acquired context manager.
+        for name, value in (
+            ("_MCP_WRITER_LOCK_CM", None),
+            ("_MCP_WRITER_READ_ONLY", False),
+            ("_MCP_WRITER_LOCK_FAILED", False),
+            ("_MCP_WRITER_LOCK_ERROR", ""),
+        ):
+            if hasattr(mcp_server, name):
+                setattr(mcp_server, name, value)
+
+
+@pytest.fixture(autouse=True)
+def _no_dns_lookups(request, monkeypatch):
+    """Keep the suite off the resolver.
+
+    ``llm_client.endpoint_is_local`` resolves a single-label host (``gpu-box``),
+    a ``.local`` name or ``host.docker.internal`` through ``getaddrinfo`` to
+    decide whether an endpoint is on the user's network, and every
+    ``OpenAICompatEmbeddingFunction`` construction runs that check. A failed
+    lookup of a placeholder such as ``http://h`` costs about 2.7 s on Windows
+    (milliseconds on Linux), which put several minutes of DNS timeouts into
+    the Windows CI run, and a real name makes the suite depend on outbound
+    DNS from the runner.
+
+    Tests use literal addresses (``127.0.0.1``) or dotted names, which never
+    resolve. One that must drive the resolver itself opts out with
+    ``@pytest.mark.resolves_dns`` and stubs ``socket.getaddrinfo``.
+    """
+    if request.node.get_closest_marker("resolves_dns"):
+        yield
+        return
+    import mempalace.llm_client as llm_client
+
+    def _refuse(host):
+        raise AssertionError(
+            f"test asked DNS to resolve {host!r}; use a literal address such as "
+            "127.0.0.1 (or a dotted name, which is judged external without a "
+            "lookup), or mark the test @pytest.mark.resolves_dns"
+        )
+
+    monkeypatch.setattr(llm_client, "_resolves_private", _refuse)
+    yield
+
+
+def _server_bind_without_reverse_dns(self):
+    import socketserver
+
+    socketserver.TCPServer.server_bind(self)
+    host, port = self.server_address[:2]
+    self.server_name = host
+    self.server_port = port
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_reverse_dns_on_http_server_bind():
+    """Bind test HTTP servers without resolving the address back to a name.
+
+    ``http.server.HTTPServer.server_bind`` sets ``server_name`` through
+    ``socket.getfqdn(host)``, a reverse lookup of the bind address. On a
+    runner whose resolver has no answer for loopback, that lookup waits out
+    the resolver's timeout: the first server each xdist worker started on the
+    hosted macOS runner took 35 s to bind. Nothing reads the name (only CGI
+    handling does), so bind as ``TCPServer`` does and keep the literal host,
+    the way ``mempalace.daemon`` already does for its own server.
+    Session-scoped so module-scoped server fixtures are covered too.
+    """
+    import http.server
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(http.server.HTTPServer, "server_bind", _server_bind_without_reverse_dns)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _release_palace_anchors():
+    """Close anchor connections on ``chroma.sqlite3`` after each test.
+
+    On Linux mempalace keeps one idle connection per database inode for the life
+    of the process; across thousands of temporary palaces that would run the
+    test process out of descriptors. Only acts when the module is loaded.
+    """
+    yield
+    import sys
+
+    inproc = sys.modules.get("mempalace.backends._inproc_sqlite")
+    if inproc is not None:
+        inproc.release_all()
+
+
+def _realign_default_backend(palace_module):
+    """Make ``palace._DEFAULT_BACKEND`` the registry's chroma instance again.
+
+    In production the two are the same object. ``reset_backends()`` (called by
+    several test modules) closes that instance and empties the registry, so the
+    next ``get_backend("chroma")`` builds a second one while ``_DEFAULT_BACKEND``
+    keeps pointing at the closed original. Later tests then patch one object
+    and the code under test uses the other.
+    """
+    from mempalace.backends import registry
+    from mempalace.backends.chroma import ChromaBackend
+
+    current = registry.get_backend("chroma")
+    if isinstance(current, ChromaBackend) and current is not palace_module._DEFAULT_BACKEND:
+        palace_module._DEFAULT_BACKEND = current
+
+
+@pytest.fixture(autouse=True)
+def _fresh_one_shot_warnings():
+    """Let every test see the warnings that fire once per process."""
+    from mempalace import _once
+
+    _once.reset()
+
+
+@pytest.fixture(autouse=True)
+def _utc_local_zone(monkeypatch):
+    """Read naive legacy timestamps as UTC so results don't depend on the host zone.
+
+    Tests that need another zone set ``timeutil._LOCAL_TZ`` themselves.
+    """
+    from datetime import timezone
+
+    from mempalace import timeutil
+
+    monkeypatch.setattr(timeutil, "_LOCAL_TZ", timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _reset_mcp_cache(monkeypatch):
+    """Reset cached MCP state between tests without importing mcp_server.
+
+    If mempalace.mcp_server is already imported, release its writer lease,
+    reset writer-status globals, and close/clear its KG and storage caches. If
+    it has not been imported, leave it unloaded so fork/spawn-based tests do
+    not inherit extra Chroma/SQLite state.
+
+    ``monkeypatch`` is an intentional ordering dependency. This fixture must
+    tear down before monkeypatch restores module globals; otherwise a writer
+    context acquired after a test patches ``_MCP_WRITER_LOCK_CM`` can be
+    discarded without its ``__exit__`` method running.
+    """
+    del monkeypatch
 
     def _clear_cache():
         try:
-            from mempalace import mcp_server
+            import sys
 
-            mcp_server._client_cache = None
-            mcp_server._collection_cache = None
+            mcp_server = sys.modules.get("mempalace.mcp_server")
+            if mcp_server is not None:
+                stop_sync = getattr(mcp_server, "_stop_peer_sync_thread", None)
+                if callable(stop_sync):
+                    try:
+                        stop_sync()
+                    except Exception:
+                        pass
+
+                _reset_loaded_mcp_writer_state(mcp_server)
+                for kg in list(getattr(mcp_server, "_kg_by_path", {}).values()):
+                    close = getattr(kg, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                if hasattr(mcp_server, "_kg_by_path"):
+                    mcp_server._kg_by_path.clear()
+
+                for ls in list(getattr(mcp_server, "_logstream_by_path", {}).values()):
+                    close = getattr(ls, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                if hasattr(mcp_server, "_logstream_by_path"):
+                    mcp_server._logstream_by_path.clear()
+
+                # Close (not just dereference) the cached chromadb client so its
+                # rust-side file handles are released; on Windows a bare deref
+                # leaves them locked and leaks across the session (#1128).
+                cached_client = getattr(mcp_server, "_client_cache", None)
+                if cached_client is not None:
+                    close = getattr(cached_client, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                mcp_server._client_cache = None
+                mcp_server._collection_cache = None
+                if hasattr(mcp_server, "_collection_cache_backend"):
+                    mcp_server._collection_cache_backend = None
+                if hasattr(mcp_server, "_collection_cache_palace"):
+                    mcp_server._collection_cache_palace = None
+                if hasattr(mcp_server, "_collection_open_error"):
+                    mcp_server._collection_open_error = None
+        except AttributeError:
+            pass
+
+        try:
+            # Reset the per-process quarantine gate so tests don't leak
+            # state through ChromaBackend._quarantined_paths, and drop cached
+            # HNSW capacity verdicts (#1471) for the same reason — a test that
+            # reuses a palace path would otherwise inherit the previous test's
+            # verdict.
+            from mempalace.backends.chroma import ChromaBackend, reset_hnsw_capacity_cache
+
+            ChromaBackend._quarantined_paths.clear()
+            reset_hnsw_capacity_cache()
+        except (ImportError, AttributeError):
+            pass
+
+        from mempalace import search_util
+
+        search_util._known_wings_cache.clear()
+
+        # Release chromadb clients opened through the backend layer. Many tests
+        # reach the store via palace.get_collection() (sweep, repair, CLI, ...),
+        # which caches one PersistentClient per palace_path on the long-lived
+        # backend singleton and never closes it. chromadb frees the rust-side
+        # SQLite/HNSW file handles only on client.close(); on POSIX the open
+        # handles are harmless, but on Windows they stay locked and accumulate
+        # across the session until a later test's HNSW segment write fails
+        # (#1128 Windows CI). close_palace() closes the client and drops the
+        # handle without marking the backend closed, so it stays reusable.
+        try:
+            from mempalace import palace as _palace
+
+            _realign_default_backend(_palace)
+            backend = getattr(_palace, "_DEFAULT_BACKEND", None)
+            clients = getattr(backend, "_clients", None)
+            if clients:
+                for path in list(clients):
+                    try:
+                        backend.close_palace(path)
+                    except Exception:
+                        pass
         except (ImportError, AttributeError):
             pass
 
@@ -67,6 +467,17 @@ def _isolate_home():
         else:
             os.environ[var] = orig
     shutil.rmtree(_session_tmp, ignore_errors=True)
+
+
+@pytest.fixture
+def tokenless_http_hub(monkeypatch):
+    """Serve MCP HTTP without a bearer token, as ``mempalace serve --no-token`` does.
+
+    The transport requires a token by default; suites that drive a loopback
+    hub with raw HTTP requests opt out with this rather than carry a token.
+    """
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN", "1")
 
 
 @pytest.fixture
@@ -101,10 +512,14 @@ def config(tmp_dir, palace_path):
 def collection(palace_path):
     """A ChromaDB collection pre-seeded in the temp palace."""
     client = chromadb.PersistentClient(path=palace_path)
-    col = client.get_or_create_collection("mempalace_drawers")
+    col = client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
     yield col
     client.delete_collection("mempalace_drawers")
-    del client
+    # close() (not a bare dereference) releases chromadb's rust-side SQLite/HNSW
+    # file handles. On Windows a mere `del` leaves them locked, so the temp
+    # palace cannot be removed and handles leak across the whole test session
+    # until a later test's HNSW write fails (#1128 Windows CI).
+    client.close()
 
 
 @pytest.fixture
@@ -165,11 +580,20 @@ def seeded_collection(collection):
     return collection
 
 
+def pytest_configure(config):
+    """On Windows, replace coverage's fail_under with the pyproject Windows gate."""
+    from coverage_gate import apply_platform_threshold
+
+    apply_platform_threshold(config)
+
+
 @pytest.fixture
 def kg(tmp_dir):
     """An isolated KnowledgeGraph using a temp SQLite file."""
     db_path = os.path.join(tmp_dir, "test_kg.sqlite3")
-    return KnowledgeGraph(db_path=db_path)
+    graph = KnowledgeGraph(db_path=db_path)
+    yield graph
+    graph.close()
 
 
 @pytest.fixture
